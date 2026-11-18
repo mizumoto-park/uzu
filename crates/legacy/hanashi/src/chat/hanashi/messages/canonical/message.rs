@@ -82,8 +82,20 @@ impl Message {
             OriginalContentBlock::Tools {
                 namespaces,
             } => {
-                let tools = namespaces.iter().flat_map(|namespace| namespace.tools.clone()).collect::<Vec<_>>();
-                serde_json::to_value(tools)
+                let mut tools = Vec::with_capacity(namespaces.iter().map(|namespace| namespace.tools.len()).sum());
+                for namespace in namespaces {
+                    let is_deferred = namespace.name == "deferred";
+                    for tool in &namespace.tools {
+                        let mut value = serde_json::to_value(tool).map_err(|error| Error::SerializationFailed {
+                            reason: error.to_string(),
+                        })?;
+                        if is_deferred && let Some(object) = value.as_object_mut() {
+                            object.insert("defer_loading".to_string(), Value::Bool(true));
+                        }
+                        tools.push(value);
+                    }
+                }
+                Ok(Value::Array(tools))
             },
             OriginalContentBlock::Text {
                 value,

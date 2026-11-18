@@ -34,7 +34,8 @@ use crate::{
             OaiTool, OaiToolCall, ToolCallStreamer, ToolParameterTypes, backfill_tool_result_names, choose_tools,
             coerce_tool_call, format_lfm3_audio_assistant_tool_calls, format_lfm3_audio_tool_preamble,
             insert_tools_message, oai_tool_call, parse_lfm3_audio_tool_calls, parse_parameter_text,
-            reply_tool_calls, to_tool_call, tool_call_result_block, tool_parameter_types, withhold_stream_text,
+            reply_tool_calls, to_tool_call, tool_call_result_block, tool_call_result_value_block, tool_parameter_types,
+            withhold_stream_text,
         },
         error::{OaiError, OaiErrorResponse, strip_backend_prefixes},
         model_slot::LoadedModel,
@@ -258,6 +259,8 @@ pub struct OaiMessage {
     pub videos: Vec<Vec<image::DynamicImage>>,
     #[serde(skip)]
     pub audios: Vec<Vec<u8>>,
+    #[serde(skip)]
+    pub tool_content_parts: Option<Vec<serde_json::Value>>,
 }
 
 impl<'de> Deserialize<'de> for OaiMessage {
@@ -279,20 +282,42 @@ impl<'de> Deserialize<'de> for OaiMessage {
         }
 
         let raw = RawMessage::deserialize(deserializer)?;
-        let (content, image_urls, images, video_urls, audios) = match raw.content {
-            None => (None, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-            Some(serde_json::Value::Null) => (None, Vec::new(), Vec::new(), Vec::new(), Vec::new()),
-            Some(serde_json::Value::String(text)) => (Some(text), Vec::new(), Vec::new(), Vec::new(), Vec::new()),
+        let (content, image_urls, images, video_urls, audios, tool_content_parts) = match raw.content {
+            None => (None, Vec::new(), Vec::new(), Vec::new(), Vec::new(), None),
+            Some(serde_json::Value::Null) => (None, Vec::new(), Vec::new(), Vec::new(), Vec::new(), None),
+            Some(serde_json::Value::String(text)) => (Some(text), Vec::new(), Vec::new(), Vec::new(), Vec::new(), None),
             Some(serde_json::Value::Array(parts)) => {
                 let mut text = String::new();
                 let mut image_urls = Vec::new();
                 let mut images = Vec::new();
                 let mut video_urls = Vec::new();
                 let mut audios = Vec::new();
+                let mut tool_parts = Vec::new();
+                let mut has_tool_reference = false;
                 for part in parts {
                     match part.get("type").and_then(serde_json::Value::as_str) {
                         Some("text") => {
-                            text.push_str(part.get("text").and_then(serde_json::Value::as_str).unwrap_or_default());
+                            let part_text = part.get("text").and_then(serde_json::Value::as_str).unwrap_or_default();
+                            text.push_str(part_text);
+                            tool_parts.push(serde_json::json!({
+                                "type": "text",
+                                "text": part_text,
+                            }));
+                        },
+                        Some("tool_reference") => {
+                            let name = part
+                                .get("name")
+                                .and_then(serde_json::Value::as_str)
+                                .ok_or_else(|| {
+                                    serde::de::Error::custom(
+                                        "content part with type 'tool_reference' is missing 'name' string",
+                                    )
+                                })?;
+                            tool_parts.push(serde_json::json!({
+                                "type": "tool_reference",
+                                "name": name,
+                            }));
+                            has_tool_reference = true;
                         },
                         Some("image_url") => {
                             let url = extract_image_url(&part).map_err(serde::de::Error::custom)?;
@@ -331,7 +356,14 @@ impl<'de> Deserialize<'de> for OaiMessage {
                         None => return Err(serde::de::Error::custom("message content part is missing a type")),
                     }
                 }
-                (Some(text), image_urls, images, video_urls, audios)
+                (
+                    Some(text),
+                    image_urls,
+                    images,
+                    video_urls,
+                    audios,
+                    has_tool_reference.then_some(tool_parts),
+                )
             },
             Some(_) => return Err(serde::de::Error::custom("message content must be a string or an array of content parts")),
         };
@@ -348,6 +380,7 @@ impl<'de> Deserialize<'de> for OaiMessage {
             video_urls,
             videos: Vec::new(),
             audios,
+            tool_content_parts,
         })
     }
 }
@@ -570,7 +603,11 @@ fn to_chat_message(message: &OaiMessage) -> ChatMessage {
         });
     }
     if let Some(identifier) = &message.tool_call_id {
-        let result = tool_call_result_block(identifier, message.content.clone().unwrap_or_default());
+        let result = if let Some(parts) = &message.tool_content_parts {
+            tool_call_result_value_block(identifier, serde_json::Value::Array(parts.clone()))
+        } else {
+            tool_call_result_block(identifier, message.content.clone().unwrap_or_default())
+        };
         chat_message = chat_message.with_block(result);
     } else if let Some(content) = message.content.as_ref().filter(|content| !content.is_empty()) {
         chat_message = chat_message.with_text(content.clone());
@@ -1304,6 +1341,7 @@ async fn run_blocking(
                 video_urls: Vec::new(),
                 videos: Vec::new(),
                 audios: Vec::new(),
+                tool_content_parts: None,
             },
             finish_reason,
         }],
@@ -2559,6 +2597,7 @@ async fn handle_vlm_completion(
                     video_urls: Vec::new(),
                     videos: Vec::new(),
                     audios: Vec::new(),
+                    tool_content_parts: None,
                 },
                 finish_reason: finish_reason.clone(),
             }],
@@ -3310,6 +3349,7 @@ async fn handle_audio_chat_completion(
                 video_urls: Vec::new(),
                 videos: Vec::new(),
                 audios: Vec::new(),
+                tool_content_parts: None,
             },
             finish_reason: finish_reason.to_string(),
         }],

@@ -33,6 +33,8 @@ pub struct OaiFunctionCall {
 
 #[derive(Deserialize)]
 pub struct OaiTool {
+    #[serde(default)]
+    pub defer_loading: bool,
     pub function: OaiToolFunction,
 }
 
@@ -43,6 +45,8 @@ pub struct OaiToolFunction {
     pub description: String,
     #[serde(default)]
     pub parameters: Option<Value>,
+    #[serde(default)]
+    pub defer_loading: bool,
 }
 
 #[derive(Deserialize)]
@@ -124,7 +128,13 @@ pub fn tool_call_result_block(
     identifier: &str,
     content: String,
 ) -> ChatContentBlock {
-    let value = serde_json::Value::String(content);
+    tool_call_result_value_block(identifier, serde_json::Value::String(content))
+}
+
+pub fn tool_call_result_value_block(
+    identifier: &str,
+    value: serde_json::Value,
+) -> ChatContentBlock {
     ChatContentBlock::ToolCallResult {
         identifier: Some(identifier.to_string()),
         name: None,
@@ -132,23 +142,43 @@ pub fn tool_call_result_block(
     }
 }
 
+fn to_tool_description(tool: &OaiTool) -> ToolDescription {
+    ToolDescription::Function {
+        tool_function: ToolFunction {
+            name: tool.function.name.clone(),
+            description: tool.function.description.clone(),
+            parameters: tool.function.parameters.clone(),
+            return_definition: None,
+        },
+    }
+}
+
 fn tools_message(tools: &[&OaiTool]) -> ChatMessage {
-    let descriptions = tools
-        .iter()
-        .map(|tool| ToolDescription::Function {
-            tool_function: ToolFunction {
-                name: tool.function.name.clone(),
-                description: tool.function.description.clone(),
-                parameters: tool.function.parameters.clone(),
-                return_definition: None,
-            },
-        })
-        .collect();
-    ChatMessage::developer().with_tool_namespaces(vec![ToolNamespace {
-        name: "functions".to_string(),
-        description: None,
-        tools: descriptions,
-    }])
+    let mut eager = Vec::new();
+    let mut deferred = Vec::new();
+    for tool in tools {
+        if tool.defer_loading || tool.function.defer_loading {
+            deferred.push(to_tool_description(tool));
+        } else {
+            eager.push(to_tool_description(tool));
+        }
+    }
+    let mut namespaces = Vec::new();
+    if !eager.is_empty() {
+        namespaces.push(ToolNamespace {
+            name: "functions".to_string(),
+            description: None,
+            tools: eager,
+        });
+    }
+    if !deferred.is_empty() {
+        namespaces.push(ToolNamespace {
+            name: "deferred".to_string(),
+            description: None,
+            tools: deferred,
+        });
+    }
+    ChatMessage::developer().with_tool_namespaces(namespaces)
 }
 
 // OpenAI tool messages carry only tool_call_id, but some chat templates render tool
